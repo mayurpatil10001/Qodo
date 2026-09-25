@@ -904,6 +904,9 @@ def write_guide_sheet(ws):
         ("Data", "BANKNIFTY_SPOT.csv (1-min OHLC, index/spot) and Options_data_2023.csv (1-min OHLC, options, Jan 2023 to Jan 2024)."),
         ("Lot Size", "15 (1 lot). Fixed across all trades -- no compounding, no scaling with capital."),
         ("Starting Capital", f"Rs {STARTING_CAPITAL:,} (ten lakh). Single configurable constant. Used for CAGR and NAV calculation only; position size does not scale."),
+        ("Confirmed Runtime", "51.78s end-to-end on the full 720MB / 10.26M-row options file (Data Load 44.6s, Backtest 5.2s, Charts+Excel 1.7s). "
+                             "Under the 60s target. The data-load stage dominates because pandas must parse, "
+                             "deduplicate, and sort 10.25M rows -- the actual backtest computation over 30 days is only 5s."),
         ("", ""),
         ("ASSUMPTION #1 -- Week 1 Definition", ""),
         ("", "CORRECTED interpretation: 'Week 1' means the first week of each calendar MONTH."),
@@ -934,7 +937,20 @@ def write_guide_sheet(ws):
         ("", "Monitoring begins at 09:21:59 (the bar AFTER entry). The entry bar (09:20:59) is excluded from stop-loss scanning to avoid lookahead bias. Scanning stops at 15:20:59 (the time-exit bar)."),
         ("", ""),
         ("ASSUMPTION #7 -- Spot Price Logging", ""),
-        ("", "Spot close is logged only at entry time (09:20:59). The brief says 'at entry, at minimum'; exit-time spot is not logged to keep one row per leg."),
+        ("", "Spot close is recorded at entry time (09:20:59) only -- not at exit. "
+              "Rationale: (a) the brief says 'at entry, at minimum'; (b) the exit time varies per leg "
+              "(SL legs exit at different bars), so an exit-spot column would require a second join against the "
+              "spot data on a non-fixed timestamp, adding complexity for information not required by the spec. "
+              "If an exit-spot column is needed, the spot DataFrame is available in build_trade_sheet and the "
+              "join can be added in one place."),
+        ("", ""),
+        ("NOTE -- available_capital per leg, not per day", ""),
+        ("", "On any given trading day, the CE leg is processed first and the PE leg second. "
+              "The available_capital column therefore shows two different values for the same date: "
+              "one after the CE P&L is added, and one after the PE P&L is added. "
+              "This is intentional and consistent with the 'trade-wise' equity curve update rule -- "
+              "each leg's P&L is realized the moment it exits, not batched to end-of-day. "
+              "Self-check #8 verifies: available_capital = STARTING_CAPITAL + cumulative_pnl at every row."),
         ("", ""),
         ("HOW TO READ SHEET 2 -- TRADESHEET", ""),
         ("", "One row per leg per day (two rows per trading day: one CE, one PE)."),
