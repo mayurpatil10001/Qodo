@@ -1,67 +1,14 @@
 """
-banknifty_backtest.py
-=====================
-Bank Nifty 09:20 Short Strangle Backtest — Hiring Assignment Submission
-Author: Candidate
-Data  : BANKNIFTY_SPOT.csv  (1-min OHLC, index/spot)
-        Options_data_2023.csv (1-min OHLC, options)
+Bank Nifty 09:20 Short Strangle Backtest
 
-STRATEGY SUMMARY
-----------------
-- Universe  : Week 1 of every expiry cycle (see ASSUMPTION #1 below)
-- Entry     : 09:20 bar close — SELL the CE and PE whose close is closest to Rs 50
-- Exit      : 15:20 close OR 50 % stop-loss (entry × 1.5) on High, whichever first
-- Sizing    : 1 lot = 15 units, fixed, no compounding
-
-ASSUMPTIONS (stated explicitly per the brief)
----------------------------------------------
-ASSUMPTION #1 — "Week 1" definition
-  Bank Nifty has WEEKLY expiries every Wednesday.  A new "expiry cycle" begins
-  the day after each Wednesday expiry.  "Week 1" is defined as the calendar
-  week (Mon–Sun block) that contains the FIRST Wednesday of that new expiry
-  cycle.  Concretely: after expiry Wednesday W, the very next Thursday is the
-  start of a new cycle; all trading days in the Mon–Fri block whose Wednesday
-  falls after W (i.e., next Wednesday W+7) form "Week 1" of that cycle.
-  This means we trade every trading day in that Mon–Fri block, including the
-  new expiry Wednesday itself.
-  This interpretation can be changed by redefining `get_week1_trading_days()`.
-
-ASSUMPTION #2 — Tie-break when two strikes are equidistant from Rs 50
-  Pick the strike with the LOWER premium (cheaper / further OTM).  This is
-  the more conservative choice: lower premium -> smaller absolute loss if the
-  stop triggers, and lower margin requirement.
-
-ASSUMPTION #3 — Stop-loss exit price
-  When a 1-min bar's High >= stop_level (entry x 1.5), we exit at the
-  stop_level itself, NOT at the bar's close.  Rationale: we set the stop at
-  that exact price, so we assume it was filled exactly there (conservative
-  for a short: our loss is capped at exactly 50 % of premium received).
-
-ASSUMPTION #4 — Starting capital
-  Rs 10,00,000 (ten lakh).  This is a single configurable constant at the top
-  of the script (STARTING_CAPITAL).  Position size does NOT scale with capital
-  — it is always 1 lot (15 units).  The running "available capital" column is
-  the starting capital plus cumulative realised P&L up to that trade row.
-
-ASSUMPTION #5 — "09:20 bar" interpretation
-  The options data timestamps are HH:MM:59 (each bar closes at :59 seconds).
-  The "09:20 close" corresponds to Time == '09:20:59'.  This is one bar after
-  '09:19:59', consistent with the bar labelling convention in the dataset.
-
-ASSUMPTION #6 — Stop-loss monitoring window
-  Stop-loss is checked from the bar AFTER entry (09:21:59 onward) up to and
-  including 15:20:59.  The entry bar itself is excluded to avoid lookahead:
-  we receive the 09:20:59 close price as our entry fill; we cannot have also
-  observed whether High on that same bar exceeded stop_level before filling.
-
-ASSUMPTION #7 — Spot price logging
-  The spot close price is recorded at entry time (09:20:59).  The brief says
-  "at entry, at minimum"; we log it only at entry to keep one row per leg.
-
-LOT SIZE AND POSITION SIZING
------------------------------
-LOT_SIZE       = 15
-STARTING_CAPITAL = 10_00_000  (Rs 10 lakh)
+Key assumptions:
+  1. Week 1: First calendar week of each month (1st through first Wednesday).
+  2. Tie-break: Lower premium chosen if two strikes are equidistant from Rs 50.
+  3. SL exit price: Filled at exact stop level (entry x 1.5).
+  4. Capital: Rs 10,00,000 base capital; 1 lot (15 units) unscaled.
+  5. 09:20 bar: Bar close at 09:20:59.
+  6. SL window: Monitored 09:21:59 to 15:20:59 (no entry-bar lookahead).
+  7. Spot price: Logged at entry time (09:20:59).
 """
 
 import time
@@ -72,67 +19,54 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")          # headless — no GUI window needed
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as XLImage
 
-# =============================================================================
-# GLOBAL CONSTANTS  — change these in one place; they propagate everywhere
-# =============================================================================
-SPOT_CSV       = Path("BANKNIFTY_SPOT.csv")
-OPTIONS_CSV    = Path("Options_data_2023.csv")
-OUTPUT_EXCEL   = Path("BankNifty_ShortStrangle_Backtest.xlsx")
-CHART_DIR      = Path("charts")             # temp folder for embedded PNGs
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SPOT_CSV         = Path("BANKNIFTY_SPOT.csv")
+OPTIONS_CSV      = Path("Options_data_2023.csv")
+OUTPUT_EXCEL     = Path("BankNifty_ShortStrangle_Backtest.xlsx")
+CHART_DIR        = Path("charts")
 
-LOT_SIZE         = 15                       # Bank Nifty lot size
-STARTING_CAPITAL = 10_00_000               # Rs 10,00,000 — ASSUMPTION #4
+LOT_SIZE         = 15
+STARTING_CAPITAL = 10_00_000
 
-TARGET_PREMIUM   = 50.0                    # Strike selection target (Rs)
-ENTRY_TIME_STR   = "09:20:59"             # 09:20 bar close — ASSUMPTION #5
-EXIT_TIME_STR    = "15:20:59"             # 15:20 bar close
-SL_MULTIPLIER    = 1.5                    # stop level = entry x 1.5
+TARGET_PREMIUM   = 50.0
+ENTRY_TIME_STR   = "09:20:59"
+EXIT_TIME_STR    = "15:20:59"
+SL_MULTIPLIER    = 1.5
 
-# =============================================================================
-# LOGGING
-# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("bnf_backtest")
-
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-# =============================================================================
-# MODULE 1: DATA LOADING & CLEANING
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 1. Data Loading & Cleaning
+# ---------------------------------------------------------------------------
 
 def load_spot(path: Path) -> pd.DataFrame:
-    """
-    Load and clean the Bank Nifty spot (index) 1-minute OHLC data.
-
-    Returns a DataFrame with:
-      - index  : datetime (Date + Time combined, no timezone)
-      - columns: open, high, low, close
-    Only rows between 09:15 and 15:30 are kept (market hours).
-    Duplicate timestamps are dropped (first kept, duplicates logged).
-    """
+    """Load and clean Bank Nifty spot 1-minute OHLC data."""
     log.info("Loading spot data from %s ...", path)
     df = pd.read_csv(path, usecols=["ts", "o", "h", "l", "c"])
     df.rename(columns={"ts": "datetime", "o": "open", "h": "high",
                         "l": "low",      "c": "close"}, inplace=True)
 
-    # Parse timestamps
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
     df["time"] = df["datetime"].dt.time
 
-    # Filter to market hours
+    # Market-hours filter
     t_start = pd.to_datetime("09:15:00").time()
     t_end   = pd.to_datetime("15:30:59").time()
     before  = len(df)
@@ -140,7 +74,6 @@ def load_spot(path: Path) -> pd.DataFrame:
     log.info("  Spot: %d rows after market-hours filter (dropped %d)",
              len(df), before - len(df))
 
-    # Drop duplicates
     dups = df.duplicated(subset="datetime", keep="first")
     if dups.sum():
         log.warning("  Spot: dropping %d duplicate timestamps", dups.sum())
@@ -154,28 +87,10 @@ def load_spot(path: Path) -> pd.DataFrame:
 
 
 def load_options(path: Path) -> pd.DataFrame:
-    """
-    Load and clean the Bank Nifty options 1-minute OHLC data.
-
-    Column mapping from the raw CSV:
-      Date, Ticker, Time, Open, High, Low, Close, Call/Put
-
-    Processing:
-      - Combine Date + Time into a single datetime column.
-      - Parse Strike and OptionType from Ticker using regex.
-      - Drop rows with missing OHLC values (warn + count).
-      - Drop duplicate (datetime, Ticker) pairs (warn + count).
-      - Keep only market hours (09:15:59 to 15:30:59).
-      - Sort by datetime, Ticker.
-
-    Returns a clean DataFrame with columns:
-      datetime, date, time_str, ticker, strike, option_type,
-      open, high, low, close
-    """
+    """Load and clean Bank Nifty options 1-minute OHLC data."""
     log.info("Loading options data from %s (~10M rows, may take 30s) ...", path)
     t0 = time.perf_counter()
 
-    # Read with specific dtypes to save memory
     dtype_map = {
         "Open":  np.float32,
         "High":  np.float32,
@@ -189,7 +104,6 @@ def load_options(path: Path) -> pd.DataFrame:
     )
     log.info("  Raw read: %d rows in %.1fs", len(df), time.perf_counter() - t0)
 
-    # -- Rename columns -------------------------------------------------------
     df.rename(columns={
         "Date":     "date_str",
         "Ticker":   "ticker",
@@ -201,24 +115,17 @@ def load_options(path: Path) -> pd.DataFrame:
         "Call/Put": "option_type",
     }, inplace=True)
 
-    # -- Combine date + time -> datetime --------------------------------------
-    # Both columns are strings; combine then parse once (fast path)
     df["datetime"] = pd.to_datetime(
         df["date_str"] + " " + df["time_str"], format="%Y-%m-%d %H:%M:%S"
     )
-    df["date"] = df["datetime"].dt.normalize()   # date-only for groupby joins
+    df["date"] = df["datetime"].dt.normalize()
 
-    # -- Parse strike from ticker using fast string slicing (no regex) --------
-    #    Ticker format is fixed: 'BANKNIFTY' (9 chars) + <digits> + 'CE'/'PE' (2 chars)
-    #    e.g. 'BANKNIFTY37000PE' -> strike = ticker[9:-2] -> '37000' -> 37000
-    #    This is ~10x faster than str.extract(regex) on 10M rows.
-    #    We validate by checking the last 2 chars match the Call/Put column.
-    TICKER_PREFIX_LEN = len("BANKNIFTY")   # 9
-    TICKER_SUFFIX_LEN = 2                   # len('CE') or len('PE')
-    ticker_suffix = df["ticker"].str[-TICKER_SUFFIX_LEN:]  # fast slice
+    # Fast slice: 'BANKNIFTY' (9 chars) + <strike> + 'CE'/'PE' (2 chars)
+    TICKER_PREFIX_LEN = 9
+    TICKER_SUFFIX_LEN = 2
+    ticker_suffix = df["ticker"].str[-TICKER_SUFFIX_LEN:]
     strike_str    = df["ticker"].str[TICKER_PREFIX_LEN:-TICKER_SUFFIX_LEN]
 
-    # Validate: all tickers should start with 'BANKNIFTY'
     bad_prefix = ~df["ticker"].str.startswith("BANKNIFTY")
     if bad_prefix.sum():
         log.warning("  Options: %d rows with non-BANKNIFTY tickers -- dropped",
@@ -227,7 +134,6 @@ def load_options(path: Path) -> pd.DataFrame:
         ticker_suffix = ticker_suffix[~bad_prefix]
         strike_str    = strike_str[~bad_prefix]
 
-    # Validate: strike_str should be all-digit
     bad_strikes = ~strike_str.str.isdigit()
     if bad_strikes.sum():
         log.warning("  Options: %d rows with non-numeric strike in ticker -- dropped",
@@ -236,30 +142,24 @@ def load_options(path: Path) -> pd.DataFrame:
         strike_str = strike_str[~bad_strikes]
 
     df["strike"] = strike_str.astype(np.int32)
-    # option_type already present in 'Call/Put' column; suffix parsed above
-    # is for validation only -- we trust the Call/Put column as ground truth.
 
-    # -- Drop rows with missing OHLC ------------------------------------------
     ohlc_cols = ["open", "high", "low", "close"]
     na_mask = df[ohlc_cols].isna().any(axis=1)
     if na_mask.sum():
         log.warning("  Options: dropping %d rows with NaN OHLC", na_mask.sum())
         df = df[~na_mask].copy()
 
-    # -- Market-hours filter (09:15:59 to 15:30:59) ---------------------------
     before = len(df)
     df = df[(df["time_str"] >= "09:15:59") & (df["time_str"] <= "15:30:59")].copy()
     log.info("  Options: %d rows after market-hours filter (dropped %d)",
              len(df), before - len(df))
 
-    # -- Drop duplicate (datetime, ticker) ------------------------------------
     dup_mask = df.duplicated(subset=["datetime", "ticker"], keep="first")
     if dup_mask.sum():
         log.warning("  Options: dropping %d duplicate (datetime, ticker) rows",
                     dup_mask.sum())
         df = df[~dup_mask].copy()
 
-    # -- Sort -----------------------------------------------------------------
     df.sort_values(["datetime", "ticker"], inplace=True)
     df.reset_index(drop=True, inplace=True)
 
@@ -269,54 +169,14 @@ def load_options(path: Path) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# MODULE 2: EXPIRY & WEEK-1 DAY SELECTION
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 2. Expiry & Week-1 Day Selection
+# ---------------------------------------------------------------------------
 
 def get_week1_trading_days(trading_dates: pd.DatetimeIndex) -> list:
     """
-    Return the list of trading dates that fall in "Week 1" of each calendar month.
-
-    ASSUMPTION #1 - Week-1 definition (auditable -- change this function only):
-    ----------------------------------------------------------
-    PREVIOUS (WRONG) INTERPRETATION: treating each Wednesday-to-Wednesday
-    span as one "expiry cycle" and calling the next span "Week 1."  With
-    weekly Bank Nifty expiries EVERY Wednesday, that logic reduces to a no-op
-    -- every single trading day satisfies the definition, because every week
-    is trivially "Week 1" of the immediately preceding weekly cycle.  That
-    is a circular definition that filters nothing.
-
-    CORRECTED INTERPRETATION:
-    "Week 1" means the first week of each calendar MONTH -- specifically, the
-    subset of trading days from the 1st of the month up to and including the
-    FIRST Wednesday of that month.  All trading days from the 1st through
-    that first Wednesday are Week-1 days; everything from Thursday onward
-    (weeks 2, 3, 4) is excluded.
-
-    Why this interpretation:
-      - "Trade only week 1" only makes sense as a restriction if it excludes
-        weeks 2/3/4.  With monthly grouping, it does.
-      - Bank Nifty monthly context: each calendar month has 4-5 Wednesday
-        expiries.  The "first week" is a natural unit meaning the first
-        mini-cycle of the month.
-      - This reduces the tradeable universe to roughly 1/4 of all trading days
-        (only Mon-Wed of the first week each month), which is a meaningful,
-        auditable filter.
-
-    Definition: for each calendar month, Week-1 days = every trading day d
-    such that d <= first Wednesday of that month.
-    (The first Wednesday is included -- it is an expiry day and still traded.)
-    ----------------------------------------------------------
-
-    Parameters
-    ----------
-    trading_dates : pd.DatetimeIndex
-        Sorted unique trading dates available in the options dataset.
-
-    Returns
-    -------
-    list of pd.Timestamp
-        All trading dates that are in Week 1 of their respective calendar month.
+    Return trading dates in Week 1 of each calendar month.
+    Defined as trading days from the 1st of the month up to and including the first Wednesday.
     """
     td = pd.DatetimeIndex(sorted(set(trading_dates)))
     df = pd.DataFrame({"date": td})
@@ -326,11 +186,9 @@ def get_week1_trading_days(trading_dates: pd.DatetimeIndex) -> list:
     for ym, grp in df.groupby("year_month"):
         wednesdays_in_month = grp.loc[grp["date"].dt.dayofweek == 2, "date"]
         if wednesdays_in_month.empty:
-            # Edge case: a month with no Wednesday trading day -- skip it.
             log.warning("  Month %s: no Wednesday trading day found -- skipped", ym)
             continue
-        first_wed = wednesdays_in_month.min()   # earliest Wednesday in this month
-        # Week 1 = every trading day from month-start up to (and incl.) first_wed
+        first_wed = wednesdays_in_month.min()
         month_week1 = grp.loc[grp["date"] <= first_wed, "date"].tolist()
         week1_days.extend(month_week1)
         log.info("  Month %s: first Wed = %s, Week-1 days = %d",
@@ -343,32 +201,15 @@ def get_week1_trading_days(trading_dates: pd.DatetimeIndex) -> list:
     return week1_days_sorted
 
 
-# =============================================================================
-# MODULE 3: STRIKE SELECTION -- closest to Rs 50 at 09:20 bar
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 3. Strike Selection
+# ---------------------------------------------------------------------------
 
 def select_strikes(opts_day: pd.DataFrame, trade_date: pd.Timestamp) -> dict:
     """
-    For a single trading day, select the CE and PE strike whose 09:20:59
-    close price is closest to Rs 50.
-
-    Parameters
-    ----------
-    opts_day  : DataFrame -- all options rows for trade_date (already filtered).
-    trade_date: pd.Timestamp
-
-    Returns
-    -------
-    dict with keys 'CE' and 'PE', each a dict:
-        {ticker, strike, option_type, entry_price}
-    or None for a leg if no valid 09:20 bar exists for that option type.
-
-    ASSUMPTION #2 -- Tie-break:
-      If two strikes have identical |close - 50|, pick the one with the LOWER
-      close price (cheaper, further OTM).  This is the more conservative choice
-      for a short-premium strategy (lower potential loss, lower margin).
+    Select CE and PE strikes whose 09:20 close is closest to Rs 50.
+    Tie-break: select lower premium strike (conservative / further OTM).
     """
-    # Filter to the 09:20:59 bar only
     at_entry = opts_day[opts_day["time_str"] == ENTRY_TIME_STR].copy()
 
     result = {}
@@ -381,11 +222,7 @@ def select_strikes(opts_day: pd.DataFrame, trade_date: pd.Timestamp) -> dict:
             result[opt_type] = None
             continue
 
-        # Distance from target premium
         leg["dist_from_target"] = (leg["close"] - TARGET_PREMIUM).abs()
-
-        # Primary sort: dist_from_target (ascending)
-        # Tie-break sort: close price (ascending) -- ASSUMPTION #2
         leg.sort_values(["dist_from_target", "close"], inplace=True)
         best = leg.iloc[0]
 
@@ -399,64 +236,38 @@ def select_strikes(opts_day: pd.DataFrame, trade_date: pd.Timestamp) -> dict:
     return result
 
 
-# =============================================================================
-# MODULE 4: SIGNAL GENERATION -- entry, stop-loss, time exit
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 4. Signal Generation & Exit Rules
+# ---------------------------------------------------------------------------
 
 def compute_exit(leg_info: dict, opts_day: pd.DataFrame, trade_date: pd.Timestamp) -> dict:
     """
-    Given an entered leg (short option), find the exit price and time using:
-      1. 50% stop-loss: first bar after entry where High >= entry x 1.5.
-         Exit price = stop_level (ASSUMPTION #3).
-      2. Time exit: 15:20:59 close if no stop is hit.
-
-    STOP-LOSS MECHANICS (no lookahead -- ASSUMPTION #6):
-    ---------------------------------------------------
-    - The entry bar is 09:20:59.  We receive the close of that bar as our fill.
-    - Stop monitoring begins at 09:21:59 (the NEXT bar).
-    - We scan bars in chronological order; the first bar where High >= stop_level
-      is the exit bar.  Exit price = stop_level (the level we set the stop at).
-    - The exit bar is included up to 15:20:59 (the time-exit bar).
-    - If no stop hit, exit at the 15:20:59 close.
-    - If 15:20:59 bar is missing, we log a warning and use the last available
-      bar at or before 15:20:59.
-
-    Parameters
-    ----------
-    leg_info : dict with ticker, strike, option_type, entry_price
-    opts_day : all options rows for that day
-    trade_date: pd.Timestamp
-
-    Returns
-    -------
-    dict with keys: exit_price, exit_time, exit_reason ('SL' or 'TIME')
+    Compute exit price and time for a leg.
+    Exits on 50% stop-loss (High >= entry * 1.5) or 15:20:59 time exit.
     """
     ticker      = leg_info["ticker"]
     entry_price = leg_info["entry_price"]
     stop_level  = entry_price * SL_MULTIPLIER
 
-    # Rows for this specific ticker on this day, after the entry bar
     ticker_rows = opts_day[
         (opts_day["ticker"] == ticker) &
-        (opts_day["time_str"] > ENTRY_TIME_STR) &   # strictly AFTER entry bar
-        (opts_day["time_str"] <= EXIT_TIME_STR)      # up to and including exit bar
+        (opts_day["time_str"] > ENTRY_TIME_STR) &
+        (opts_day["time_str"] <= EXIT_TIME_STR)
     ].copy()
 
-    # -- Stop-loss scan (vectorized comparison, then argmax for first hit) ----
-    # Using High column as required: for a short position, rising price hurts;
-    # High is the most adverse price within the 1-min bar for a short seller.
+    # 1. Stop-loss check on bar High
     if not ticker_rows.empty:
-        sl_hit = ticker_rows["high"] >= stop_level   # boolean Series
+        sl_hit = ticker_rows["high"] >= stop_level
         if sl_hit.any():
-            first_sl_idx = sl_hit.idxmax()           # index of first True
+            first_sl_idx = sl_hit.idxmax()
             sl_row = ticker_rows.loc[first_sl_idx]
             return {
-                "exit_price":  stop_level,           # ASSUMPTION #3
+                "exit_price":  stop_level,
                 "exit_time":   sl_row["time_str"],
                 "exit_reason": "SL",
             }
 
-    # -- Time exit at 15:20:59 ------------------------------------------------
+    # 2. Time exit at 15:20:59
     time_exit_rows = ticker_rows[ticker_rows["time_str"] == EXIT_TIME_STR]
     if not time_exit_rows.empty:
         exit_price = float(time_exit_rows.iloc[0]["close"])
@@ -466,8 +277,7 @@ def compute_exit(leg_info: dict, opts_day: pd.DataFrame, trade_date: pd.Timestam
             "exit_reason": "TIME",
         }
 
-    # -- Fallback: last available bar before 15:20:59 -------------------------
-    # Handles missing 15:20 bar gracefully -- ASSUMPTION: use last close
+    # 3. Fallback: last available bar before 15:20
     fallback_rows = opts_day[
         (opts_day["ticker"] == ticker) &
         (opts_day["time_str"] > ENTRY_TIME_STR) &
@@ -483,109 +293,78 @@ def compute_exit(leg_info: dict, opts_day: pd.DataFrame, trade_date: pd.Timestam
             "exit_reason": "TIME_FALLBACK",
         }
 
-    # -- No data at all after entry -- log and return NaN ---------------------
     log.warning("  %s %s: No post-entry data found -- P&L set to 0",
                 trade_date.date(), ticker)
     return {
-        "exit_price":  entry_price,   # effectively 0 P&L
+        "exit_price":  entry_price,
         "exit_time":   EXIT_TIME_STR,
         "exit_reason": "NO_DATA",
     }
 
 
-# =============================================================================
-# MODULE 5: POSITION SIZING
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 5. Position Sizing
+# ---------------------------------------------------------------------------
 
 def get_quantity() -> int:
-    """
-    Return fixed quantity per leg.
-    1 lot x LOT_SIZE = 15 units.
-    Position size does NOT scale with capital (fixed sizing).
-    """
-    return LOT_SIZE   # 15 units per leg, fixed, no compounding
+    return LOT_SIZE
 
 
-# =============================================================================
-# MODULE 6: P&L AND TRADE SHEET GENERATION
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 6. Trade Sheet Construction
+# ---------------------------------------------------------------------------
 
 def build_trade_sheet(
     week1_days: list,
     opts: pd.DataFrame,
     spot: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Main backtest loop: iterates over ~50 Week-1 trading days (not over
-    minute bars -- the per-bar work is vectorized inside compute_exit()).
-
-    For each day:
-      - Select strikes (Module 3).
-      - Compute exit for each leg (Module 4).
-      - Build one row per leg in the trade sheet.
-
-    Returns
-    -------
-    pd.DataFrame with all required trade sheet columns (one row per leg per day).
-    """
+    """Iterate through week-1 trading days to build full trade sheet."""
     qty   = get_quantity()
     rows  = []
     cum_pnl = 0.0
     available_capital = float(STARTING_CAPITAL)
 
-    # -- Pre-extract spot 09:20 prices for all days (vectorized) -------------
-    # We look them up by date in a dict for O(1) access per day.
     spot_reset = spot.reset_index()
     spot_reset["time_str"] = spot_reset["datetime"].dt.strftime("%H:%M:%S")
     spot_entry = spot_reset[spot_reset["time_str"] == ENTRY_TIME_STR].copy()
     spot_entry["date"] = spot_entry["datetime"].dt.normalize()
     spot_price_at_entry = spot_entry.set_index("date")["close"].to_dict()
 
-    # -- Pre-group options by date for fast lookup ----------------------------
     opts_grouped = dict(tuple(opts.groupby("date")))
 
     log.info("Building trade sheet over %d Week-1 days ...", len(week1_days))
 
     for trade_date in week1_days:
         td = pd.Timestamp(trade_date)
-
-        # -- Filter options to this day (O(1) dict lookup) --------------------
         opts_day = opts_grouped.get(td, None)
 
         if opts_day is None or opts_day.empty:
             log.warning("  %s: No options data found -- day skipped", td.date())
             continue
 
-        # -- Strike selection -------------------------------------------------
         strikes = select_strikes(opts_day, td)
-
-        # -- Spot price at entry ----------------------------------------------
         spot_entry_price = spot_price_at_entry.get(td, np.nan)
 
-        # -- Build rows for CE and PE legs ------------------------------------
         for opt_type in ("CE", "PE"):
             leg = strikes.get(opt_type)
             if leg is None:
-                continue   # already logged in select_strikes
+                continue
 
-            # Compute exit
             exit_info = compute_exit(leg, opts_day, td)
 
             entry_price = leg["entry_price"]
             exit_price  = exit_info["exit_price"]
             entry_value = entry_price * qty
             exit_value  = exit_price  * qty
-
-            # For a SHORT position: P&L = sell_price - buy_back_price (per unit)
-            # Gross P&L = entry_value - exit_value
-            gross_pnl = entry_value - exit_value
+            gross_pnl   = entry_value - exit_value
 
             cum_pnl          += gross_pnl
             available_capital = STARTING_CAPITAL + cum_pnl
 
             rows.append({
                 "entry_date":        td.date(),
-                "exit_date":         td.date(),      # same day (intraday)
+                "exit_date":         td.date(),
                 "entry_time":        ENTRY_TIME_STR,
                 "exit_time":         exit_info["exit_time"],
                 "exit_reason":       exit_info["exit_reason"],
@@ -610,28 +389,12 @@ def build_trade_sheet(
     return df
 
 
-# =============================================================================
-# MODULE 7: STATISTICS
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 7. Performance Statistics
+# ---------------------------------------------------------------------------
 
 def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
-    """
-    Compute all required statistics from the trade sheet.
-
-    Statistics computed:
-    --------------------
-    - CAGR: (end_NAV / start_NAV)^(1/years) - 1, where start_NAV = STARTING_CAPITAL
-    - Max Drawdown: from running-peak equity curve (trade-wise)
-    - Win/Loss counts and percentages: CE, PE, combined
-    - Average % P&L: CE vs PE, expiry-day vs non-expiry-day
-    - Monthly % P&L table
-    - Equity curve (NAV = 100 base, updated trade-wise)
-
-    Returns
-    -------
-    dict with keys: stats_summary, monthly_pnl, equity_curve, drawdown_curve,
-                    win_loss_table, avg_pct_pnl_table
-    """
+    """Compute CAGR, drawdown, win rates, and monthly returns."""
     if trade_sheet.empty:
         log.warning("Trade sheet is empty -- no statistics to compute")
         return {}
@@ -639,22 +402,15 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
     df = trade_sheet.copy()
     df["entry_date"] = pd.to_datetime(df["entry_date"])
 
-    # -- Equity curve (trade-wise, base NAV = 100) ----------------------------
-    # NAV is updated after every individual leg's P&L is realized.
-    # equity = STARTING_CAPITAL + cumulative_pnl
-    # NAV_index = equity / STARTING_CAPITAL x 100
     df = df.reset_index(drop=True)
     df["equity"]    = STARTING_CAPITAL + df["cumulative_pnl"]
     df["nav_index"] = df["equity"] / STARTING_CAPITAL * 100.0
 
-    # -- Running peak and drawdown --------------------------------------------
-    # Start the peak at NAV = 100 (before any trade)
     nav_series      = pd.concat([pd.Series([100.0]), df["nav_index"]])
     running_peak    = nav_series.cummax()
-    drawdown_series = (nav_series - running_peak) / running_peak  # always <= 0
-    max_drawdown    = drawdown_series.min()                        # most negative
+    drawdown_series = (nav_series - running_peak) / running_peak
+    max_drawdown    = drawdown_series.min()
 
-    # -- CAGR -----------------------------------------------------------------
     start_date = df["entry_date"].min()
     end_date   = df["entry_date"].max()
     years      = max((end_date - start_date).days / 365.25, 1 / 365.25)
@@ -662,7 +418,6 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
     end_nav    = df["equity"].iloc[-1]
     cagr       = (end_nav / start_nav) ** (1 / years) - 1
 
-    # -- Win / Loss -----------------------------------------------------------
     df["is_win"] = df["gross_pnl"] > 0
 
     def win_loss_stats(sub: pd.DataFrame, label: str) -> dict:
@@ -683,11 +438,7 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
     wl_pe   = win_loss_stats(df[df["option_type"] == "PE"], "PE")
     wl_all  = win_loss_stats(df, "Combined")
 
-    # -- Average % P&L --------------------------------------------------------
-    # % P&L per trade = gross_pnl / entry_value
     df["pct_pnl"] = df["gross_pnl"] / df["entry_value"] * 100
-
-    # Identify expiry days (Wednesdays in trading dates)
     df["is_expiry"] = df["entry_date"].dt.dayofweek == 2
 
     def avg_pct(sub, label):
@@ -709,8 +460,6 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
         avg_pct(df,                                                    "All -- Combined"),
     ]
 
-    # -- Monthly P&L ----------------------------------------------------------
-    # Group cumulative P&L by month-end NAV; compute month-over-month %
     df["ym"]           = df["entry_date"].dt.to_period("M")
     monthly_last_nav   = df.groupby("ym")["nav_index"].last()
     monthly_first_nav  = pd.Series(
@@ -725,7 +474,6 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
         "Monthly % P&L":  monthly_pct_pnl.values.round(4),
     })
 
-    # -- Total P&L summary ----------------------------------------------------
     stats_summary = {
         "CAGR (%)":             round(cagr * 100, 4),
         "Max Drawdown (%)":     round(max_drawdown * 100, 4),
@@ -747,29 +495,22 @@ def compute_statistics(trade_sheet: pd.DataFrame) -> dict:
         "stats_summary":   stats_summary,
         "monthly_pnl":     monthly_df,
         "equity_curve":    df[["entry_date", "ticker", "nav_index", "equity"]].copy(),
-        "drawdown_series": drawdown_series.values * 100,   # in %
+        "drawdown_series": drawdown_series.values * 100,
         "win_loss":        [wl_ce, wl_pe, wl_all],
         "avg_pct_pnl":     avg_pnl_rows,
         "trade_df":        df,
     }
 
 
-# =============================================================================
-# MODULE 7b: CHART GENERATION (helpers for Excel embedding)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# 8. Chart Rendering
+# ---------------------------------------------------------------------------
 
 def save_equity_chart(equity_curve: pd.DataFrame, drawdown_series: np.ndarray,
                       chart_dir: Path) -> tuple:
-    """
-    Generate and save:
-      1. Equity curve chart (NAV index, base=100)
-      2. Drawdown chart (with max drawdown point annotated)
-
-    Returns paths to the two saved PNG files.
-    """
+    """Generate and save equity and drawdown charts."""
     chart_dir.mkdir(exist_ok=True)
 
-    # -- Style setup ----------------------------------------------------------
     plt.rcParams.update({
         "figure.facecolor": "#0d1117",
         "axes.facecolor":   "#161b22",
@@ -787,7 +528,7 @@ def save_equity_chart(equity_curve: pd.DataFrame, drawdown_series: np.ndarray,
     x   = np.arange(len(equity_curve))
     nav = equity_curve["nav_index"].values
 
-    # -- Chart 1: Equity Curve ------------------------------------------------
+    # Equity curve
     fig1, ax1 = plt.subplots(figsize=(14, 6))
     ax1.plot(x, nav, color="#58a6ff", linewidth=1.5, label="NAV Index")
     ax1.axhline(100, color="#8b949e", linewidth=0.8, linestyle="--", label="Base NAV=100")
@@ -805,8 +546,8 @@ def save_equity_chart(equity_curve: pd.DataFrame, drawdown_series: np.ndarray,
     plt.close(fig1)
     log.info("  Equity curve chart saved -> %s", equity_path)
 
-    # -- Chart 2: Drawdown Curve ----------------------------------------------
-    dd    = drawdown_series                            # in %, length = len(nav)+1
+    # Drawdown curve
+    dd    = drawdown_series
     x_dd  = np.arange(len(dd))
     max_dd_idx = int(np.argmin(dd))
     max_dd_val = dd[max_dd_idx]
@@ -839,11 +580,9 @@ def save_equity_chart(equity_curve: pd.DataFrame, drawdown_series: np.ndarray,
     return str(equity_path), str(dd_path)
 
 
-# =============================================================================
-# MODULE 8: EXCEL OUTPUT
-# =============================================================================
-
-# -- Excel styling helpers ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# 9. Excel Export
+# ---------------------------------------------------------------------------
 
 def _header_font():
     return Font(bold=True, color="FFFFFF", name="Calibri", size=11)
@@ -885,10 +624,9 @@ def _auto_col_width(ws, min_width=10, max_width=35):
 
 
 def write_guide_sheet(ws):
-    """Write the Guide sheet with plain-English explanations of the backtest."""
+    """Write the Guide sheet with methodology explanations."""
     ws.title = "Guide"
 
-    # Title
     ws.merge_cells("A1:E1")
     title_cell = ws["A1"]
     title_cell.value     = "BankNifty Short Strangle Backtest -- Guide & Interpretation"
@@ -984,7 +722,7 @@ def write_guide_sheet(ws):
 
 
 def write_trade_sheet(ws, trade_df: pd.DataFrame):
-    """Write the full trade sheet to the Excel worksheet."""
+    """Write trade log to the Tradesheet worksheet."""
     ws.title = "Tradesheet"
 
     headers = [
@@ -1005,22 +743,20 @@ def write_trade_sheet(ws, trade_df: pd.DataFrame):
         "cumulative_pnl", "available_capital", "spot_at_entry",
     ]
 
-    # Number formats for numeric columns (index 0-based, 1-indexed in Excel)
     num_fmts = [
-        None, None, None, None, None,           # dates/strings
-        None, "#,##0", None,                     # ticker, strike, opt_type
-        "#,##0.00", "#,##0.00", "#,##0",         # entry_price, exit_price, qty
-        "#,##0.00", "#,##0.00",                  # entry_val, exit_val
-        '#,##0.00;[Red]-#,##0.00',               # gross_pnl
-        '#,##0.00;[Red]-#,##0.00',               # cum_pnl
-        "#,##0.00",                               # avail_cap
-        "#,##0.00",                               # spot
+        None, None, None, None, None,
+        None, "#,##0", None,
+        "#,##0.00", "#,##0.00", "#,##0",
+        "#,##0.00", "#,##0.00",
+        '#,##0.00;[Red]-#,##0.00',
+        '#,##0.00;[Red]-#,##0.00',
+        "#,##0.00",
+        "#,##0.00",
     ]
 
     for row_idx, (_, row) in enumerate(trade_df.iterrows(), start=2):
         values = [row[c] if c in row.index else "" for c in col_map]
         _write_data_row(ws, row_idx, values, num_fmts)
-        # Colour CE rows light blue, PE rows light orange
         opt_fill = "DDEEFF" if row["option_type"] == "CE" else "FFF0E0"
         for col in range(1, len(headers) + 1):
             ws.cell(row=row_idx, column=col).fill = PatternFill("solid", fgColor=opt_fill)
@@ -1030,11 +766,10 @@ def write_trade_sheet(ws, trade_df: pd.DataFrame):
 
 
 def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
-    """Write the statistics sheet with tables and embedded charts."""
+    """Write summary tables, monthly breakdown, and embedded charts."""
     ws.title = "Statistics"
 
     row = 1
-    # -- Summary Stats --------------------------------------------------------
     ws.merge_cells(f"A{row}:B{row}")
     hdr = ws.cell(row=row, column=1, value="Summary Statistics")
     hdr.font      = Font(bold=True, color="FFFFFF", size=13, name="Calibri")
@@ -1054,7 +789,7 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 
     row += 1
 
-    # -- Win/Loss Table -------------------------------------------------------
+    # Win/Loss Table
     wl_headers = ["Segment", "Total Trades", "Wins", "Losses", "Win %", "Loss %"]
     _write_header_row(ws, row, wl_headers, fill_hex="375623")
     row += 1
@@ -1067,7 +802,7 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 
     row += 1
 
-    # -- Average % P&L Table -------------------------------------------------
+    # Average % P&L Table
     avg_headers = ["Segment", "Trade Count", "Avg % P&L"]
     _write_header_row(ws, row, avg_headers, fill_hex="6B3FA0")
     row += 1
@@ -1078,7 +813,7 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 
     row += 1
 
-    # -- Monthly P&L Table ---------------------------------------------------
+    # Monthly P&L Table
     monthly_df = stats["monthly_pnl"]
     monthly_headers = list(monthly_df.columns)
     _write_header_row(ws, row, monthly_headers, fill_hex="9E3B00")
@@ -1097,7 +832,7 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 
     row += 2
 
-    # -- Embed charts ---------------------------------------------------------
+    # Embed charts
     ws.cell(row=row, column=1, value="Equity Curve").font = \
         Font(bold=True, size=12, color="1F4E79", name="Calibri")
     row += 1
@@ -1106,7 +841,7 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
         img1.width  = 900
         img1.height = 380
         ws.add_image(img1, f"A{row}")
-        row += 28   # approximate row advance for image height
+        row += 28
     except Exception as e:
         log.warning("Could not embed equity chart: %s", e)
 
@@ -1121,10 +856,10 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
     except Exception as e:
         log.warning("Could not embed drawdown chart: %s", e)
 
-    # -- Equity Curve table (underlying data) -- placed in column G onward ---
+    # Underlying equity curve data table
     ec = stats["equity_curve"]
     ec_headers = ["Trade #", "Date", "Ticker", "NAV Index", "Equity (Rs)"]
-    ec_start_col = 7   # column G
+    ec_start_col = 7
     for ci, h in enumerate(ec_headers, start=ec_start_col):
         cell = ws.cell(row=1, column=ci, value=h)
         cell.font      = _header_font()
@@ -1153,16 +888,10 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 def write_excel(trade_df: pd.DataFrame, stats: dict,
                 equity_path: str, dd_path: str,
                 output_path: Path):
-    """
-    Write the 3-sheet Excel workbook in the required order:
-      Sheet 1: Guide
-      Sheet 2: Tradesheet
-      Sheet 3: Statistics
-    """
+    """Write Guide, Tradesheet, and Statistics sheets to Excel."""
     log.info("Writing Excel workbook -> %s ...", output_path)
     wb = Workbook()
 
-    # Workbook starts with one default sheet -- rename to Guide
     ws_guide = wb.active
     write_guide_sheet(ws_guide)
 
@@ -1176,12 +905,12 @@ def write_excel(trade_df: pd.DataFrame, stats: dict,
     log.info("Excel saved: %s", output_path)
 
 
-# =============================================================================
-# TIMING WRAPPER
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Timing Helper
+# ---------------------------------------------------------------------------
 
 class Timer:
-    """Simple context-manager timer that stores elapsed seconds."""
+    """Context manager for timing pipeline stages."""
     def __init__(self, label):
         self.label   = label
         self.elapsed = 0.0
@@ -1195,9 +924,9 @@ class Timer:
         log.info("  [STAGE] %s: %.2fs", self.label, self.elapsed)
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Main Pipeline
+# ---------------------------------------------------------------------------
 
 def main():
     total_start = time.perf_counter()
@@ -1207,20 +936,20 @@ def main():
     print("  BANK NIFTY SHORT STRANGLE BACKTEST -- 09:20 Entry")
     print("=" * 70 + "\n")
 
-    # -- Stage 1: Data Load --------------------------------------------------
+    # Stage 1: Data Load
     with Timer("Data Load") as t_load:
         spot = load_spot(SPOT_CSV)
         opts = load_options(OPTIONS_CSV)
     timings["Data Load"] = t_load.elapsed
 
-    # -- Stage 2: Week-1 Day Selection ---------------------------------------
+    # Stage 2: Week-1 Day Selection
     with Timer("Week-1 Selection") as t_week:
         trading_dates = opts["date"].drop_duplicates().sort_values()
         trading_dti   = pd.DatetimeIndex(trading_dates)
         week1_days    = get_week1_trading_days(trading_dti)
     timings["Week-1 Selection"] = t_week.elapsed
 
-    # -- Stage 3: Backtest (trade sheet) -------------------------------------
+    # Stage 3: Backtest
     with Timer("Backtest") as t_bt:
         trade_df = build_trade_sheet(week1_days, opts, spot)
     timings["Backtest"] = t_bt.elapsed
@@ -1229,24 +958,24 @@ def main():
         log.error("No trades generated -- check data and Week-1 logic. Exiting.")
         return
 
-    # -- Stage 4: Statistics -------------------------------------------------
+    # Stage 4: Statistics
     with Timer("Statistics") as t_stats:
         stats = compute_statistics(trade_df)
     timings["Statistics"] = t_stats.elapsed
 
-    # -- Stage 5: Charts -----------------------------------------------------
+    # Stage 5: Charts
     with Timer("Charts") as t_charts:
         equity_path, dd_path = save_equity_chart(
             stats["equity_curve"], stats["drawdown_series"], CHART_DIR
         )
     timings["Charts"] = t_charts.elapsed
 
-    # -- Stage 6: Excel Output -----------------------------------------------
+    # Stage 6: Excel Export
     with Timer("Excel Write") as t_xl:
         write_excel(trade_df, stats, equity_path, dd_path, OUTPUT_EXCEL)
     timings["Excel Write"] = t_xl.elapsed
 
-    # -- Final Report --------------------------------------------------------
+    # Summary Report
     total_elapsed = time.perf_counter() - total_start
 
     print("\n" + "=" * 70)
@@ -1275,9 +1004,7 @@ def main():
     print(stats["monthly_pnl"].to_string(index=False))
     print()
 
-    # -- Self-check assertions (real computed checks, not cosmetic Trues) ------
-    # Each check is an actual assertion evaluated against trade_df and stats.
-    # A FAIL here means something in the code is wrong, not just undocumented.
+    # Integrity Assertions
     print("\n  SELF-CHECK (computed assertions against trade data)")
     print("=" * 70)
 
@@ -1292,7 +1019,7 @@ def main():
 
     all_passed = True
 
-    # 1. Every traded date is a Week-1 date
+    # 1. Week-1 date validation
     traded_dates = set(pd.Timestamp(d) for d in trade_df["entry_date"].unique())
     non_week1 = traded_dates - week1_set
     all_passed &= check(
@@ -1301,7 +1028,7 @@ def main():
         f"{len(non_week1)} non-Week1 dates found" if non_week1 else "all dates verified",
     )
 
-    # 2. SL exits: exit_time > entry_time (no lookahead — stop can't fire at or before entry)
+    # 2. SL timing check (no lookahead)
     sl_rows = trade_df[trade_df["exit_reason"] == "SL"]
     if not sl_rows.empty:
         lookahead_sl = sl_rows[sl_rows["exit_time"] <= sl_rows["entry_time"]]
@@ -1313,7 +1040,7 @@ def main():
     else:
         check("SL exits are strictly after entry time", True, "no SL exits in dataset")
 
-    # 3. Time exits: exit_time == EXIT_TIME_STR (or TIME_FALLBACK)
+    # 3. Time exits at or before 15:20:59
     time_rows = trade_df[trade_df["exit_reason"].isin(["TIME", "TIME_FALLBACK"])]
     wrong_time = time_rows[time_rows["exit_time"] > EXIT_TIME_STR]
     all_passed &= check(
@@ -1322,14 +1049,14 @@ def main():
         f"{len(wrong_time)} exits after 15:20" if not wrong_time.empty else f"{len(time_rows)} time exits verified",
     )
 
-    # 4. Fixed lot size — no scaling
+    # 4. Fixed lot size
     all_passed &= check(
         "Position size fixed at LOT_SIZE throughout",
         bool((trade_df["quantity"] == LOT_SIZE).all()),
         f"all {len(trade_df)} rows have qty={LOT_SIZE}",
     )
 
-    # 5. One row per (date, option_type) — no duplicate legs
+    # 5. Unique leg per date
     dup_legs = trade_df.duplicated(subset=["entry_date", "option_type"], keep=False)
     all_passed &= check(
         "No duplicate (date, option_type) rows",
@@ -1337,7 +1064,7 @@ def main():
         f"{dup_legs.sum()} duplicate leg rows found" if dup_legs.any() else "unique",
     )
 
-    # 6. Gross P&L sign sanity: short P&L = entry_value - exit_value
+    # 6. Gross P&L formula: entry_value - exit_value
     recomputed_pnl = (trade_df["entry_value"] - trade_df["exit_value"]).round(4)
     pnl_mismatch = (recomputed_pnl - trade_df["gross_pnl"]).abs() > 0.01
     all_passed &= check(
@@ -1346,7 +1073,7 @@ def main():
         f"{pnl_mismatch.sum()} mismatches" if pnl_mismatch.any() else "all verified",
     )
 
-    # 7. Cumulative P&L is monotonically consistent (each row = prior + gross_pnl)
+    # 7. Cumulative P&L consistency
     expected_cum = trade_df["gross_pnl"].cumsum().round(4)
     cum_mismatch = (expected_cum - trade_df["cumulative_pnl"]).abs() > 0.01
     all_passed &= check(
@@ -1355,7 +1082,7 @@ def main():
         f"{cum_mismatch.sum()} mismatches" if cum_mismatch.any() else "all verified",
     )
 
-    # 8. Available capital = STARTING_CAPITAL + cumulative_pnl at every row
+    # 8. Available capital formula
     expected_cap = (STARTING_CAPITAL + trade_df["cumulative_pnl"]).round(4)
     cap_mismatch = (expected_cap - trade_df["available_capital"]).abs() > 0.01
     all_passed &= check(
@@ -1364,8 +1091,7 @@ def main():
         f"{cap_mismatch.sum()} mismatches" if cap_mismatch.any() else "all verified",
     )
 
-    # 9. Max drawdown computed from running peak (not just min of NAV series)
-    #    Verify: drawdown at each point = (nav - running_peak) / running_peak
+    # 9. Max drawdown calculation
     nav_s = pd.concat([pd.Series([100.0]), td_full["nav_index"]])
     peak_s = nav_s.cummax()
     dd_s   = (nav_s - peak_s) / peak_s * 100
@@ -1377,7 +1103,7 @@ def main():
         f"reported={reported_maxdd:.4f}% computed={computed_maxdd:.4f}%",
     )
 
-    # 10. SL stop price = entry * 1.5 (not bar close)
+    # 10. SL price check
     if not sl_rows.empty:
         expected_sl_price = (sl_rows["entry_price"] * SL_MULTIPLIER).round(4)
         sl_price_ok = (expected_sl_price - sl_rows["exit_price"]).abs() < 0.01
