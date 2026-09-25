@@ -672,8 +672,8 @@ def write_guide_sheet(ws):
         ("", ""),
         ("4. WORKSHEET STRUCTURE & OUTPUT INTERPRETATION", ""),
         ("Sheet 1: Guide", "Complete assignment documentation, step-by-step runtime benchmarks, methodology, and interpretation."),
-        ("Sheet 2: Tradesheet", "Complete trade log: Entry/Exit Date & Time, Option Ticker, Strike, Type, Entry/Exit Price, Qty, Entry/Exit Value, Gross P&L, Cumulative P&L, Available Capital, Spot at Entry."),
-        ("Sheet 3: Statistics", "Summary KPIs (CAGR, Max DD, Total P&L), Win/Loss breakdown (CE/PE/Combined), Average % P&L table, Monthly % P&L table, Trade-wise NAV table, and embedded Charts."),
+        ("Sheet 2: Statistics", "Summary KPIs (CAGR, Max DD, Total P&L), Win/Loss breakdown (CE/PE/Combined), Average % P&L table, Monthly % P&L table, Trade-wise NAV table, and embedded Charts."),
+        ("Sheet 3: Tradesheet", "Complete trade log: Entry/Exit Date & Time, Option Ticker, Strike, Type, Entry/Exit Price, Qty, Entry/Exit Value, Gross P&L, Cumulative P&L, Available Capital, Spot at Entry."),
         ("", ""),
         ("5. METHODOLOGICAL ASSUMPTIONS", ""),
         ("ASSUMPTION #1 -- Week 1 Definition", "Week 1 is defined as trading days from the 1st of each calendar month up to and including the month's first Wednesday. Thursday onward is excluded."),
@@ -868,18 +868,18 @@ def write_statistics_sheet(ws, stats: dict, equity_path: str, dd_path: str):
 def write_excel(trade_df: pd.DataFrame, stats: dict,
                 equity_path: str, dd_path: str,
                 output_path: Path):
-    """Write Guide, Tradesheet, and Statistics sheets to Excel."""
+    """Write Guide, Statistics, and Tradesheet sheets to Excel."""
     log.info("Writing Excel workbook -> %s ...", output_path)
     wb = Workbook()
 
     ws_guide = wb.active
     write_guide_sheet(ws_guide)
 
-    ws_trade = wb.create_sheet()
-    write_trade_sheet(ws_trade, trade_df)
-
     ws_stats = wb.create_sheet()
     write_statistics_sheet(ws_stats, stats, equity_path, dd_path)
+
+    ws_trade = wb.create_sheet()
+    write_trade_sheet(ws_trade, trade_df)
 
     wb.save(output_path)
     log.info("Excel saved: %s", output_path)
