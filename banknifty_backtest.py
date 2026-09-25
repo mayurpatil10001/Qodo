@@ -275,31 +275,38 @@ def load_options(path: Path) -> pd.DataFrame:
 
 def get_week1_trading_days(trading_dates: pd.DatetimeIndex) -> list:
     """
-    Return the list of trading dates that fall in "Week 1" of each expiry cycle.
+    Return the list of trading dates that fall in "Week 1" of each calendar month.
 
-    ASSUMPTION #1 - Week-1 definition (auditable, change this function only):
+    ASSUMPTION #1 - Week-1 definition (auditable -- change this function only):
     ----------------------------------------------------------
-    Bank Nifty has WEEKLY expiries every Wednesday.
-    Expiry cycle rule:
-      - Each Wednesday in the dataset that is a trading day is an expiry date.
-      - After expiry on Wednesday W, the next cycle starts Thursday W+1.
-      - "Week 1" of that cycle = the Mon-Fri calendar week containing the
-        NEXT Wednesday (W+7).  In other words, it is the calendar week that
-        IMMEDIATELY follows the expiry week.
-      - Every trading day in that Mon-Fri block is a "Week 1" trading day.
-      - NOTE: The expiry Wednesday itself (W+7) is INCLUDED -- it is the last
-        day of Week 1 and trades are still taken that day (entry at 09:20,
-        exit before 15:20 or on stop-loss).
+    PREVIOUS (WRONG) INTERPRETATION: treating each Wednesday-to-Wednesday
+    span as one "expiry cycle" and calling the next span "Week 1."  With
+    weekly Bank Nifty expiries EVERY Wednesday, that logic reduces to a no-op
+    -- every single trading day satisfies the definition, because every week
+    is trivially "Week 1" of the immediately preceding weekly cycle.  That
+    is a circular definition that filters nothing.
+
+    CORRECTED INTERPRETATION:
+    "Week 1" means the first week of each calendar MONTH -- specifically, the
+    subset of trading days from the 1st of the month up to and including the
+    FIRST Wednesday of that month.  All trading days from the 1st through
+    that first Wednesday are Week-1 days; everything from Thursday onward
+    (weeks 2, 3, 4) is excluded.
+
+    Why this interpretation:
+      - "Trade only week 1" only makes sense as a restriction if it excludes
+        weeks 2/3/4.  With monthly grouping, it does.
+      - Bank Nifty monthly context: each calendar month has 4-5 Wednesday
+        expiries.  The "first week" is a natural unit meaning the first
+        mini-cycle of the month.
+      - This reduces the tradeable universe to roughly 1/4 of all trading days
+        (only Mon-Wed of the first week each month), which is a meaningful,
+        auditable filter.
+
+    Definition: for each calendar month, Week-1 days = every trading day d
+    such that d <= first Wednesday of that month.
+    (The first Wednesday is included -- it is an expiry day and still traded.)
     ----------------------------------------------------------
-    Steps:
-      1. Identify all Wednesdays in trading_dates (these are expiry days).
-      2. For each consecutive pair of expiry Wednesdays (W_prev, W_next):
-         Week 1 = all trading_dates in the half-open interval
-                  (W_prev, W_next] i.e., Thursday after W_prev through
-                  and including W_next.
-      3. The first expiry cycle has no W_prev; its Week 1 is treated as all
-         trading days from the dataset start through (and including) the
-         FIRST Wednesday.
 
     Parameters
     ----------
@@ -309,39 +316,30 @@ def get_week1_trading_days(trading_dates: pd.DatetimeIndex) -> list:
     Returns
     -------
     list of pd.Timestamp
-        All trading dates that are in Week 1 of some expiry cycle.
+        All trading dates that are in Week 1 of their respective calendar month.
     """
     td = pd.DatetimeIndex(sorted(set(trading_dates)))
-
-    # All Wednesdays that are trading days = expiry dates
-    wednesdays = td[td.dayofweek == 2]          # dayofweek: Mon=0, Wed=2, Fri=4
-
-    if len(wednesdays) == 0:
-        log.warning("No Wednesday expiry days found in trading dates!")
-        return []
+    df = pd.DataFrame({"date": td})
+    df["year_month"] = df["date"].dt.to_period("M")
 
     week1_days = []
-
-    # Cycle 0: from dataset start through first Wednesday (inclusive)
-    first_wed = wednesdays[0]
-    cycle0_days = td[td <= first_wed].tolist()
-    week1_days.extend(cycle0_days)
-    log.info("  Cycle 0 (start -> %s): %d Week-1 days", first_wed.date(),
-             len(cycle0_days))
-
-    # Remaining cycles: (W_prev, W_next] for each consecutive Wednesday pair
-    for i in range(1, len(wednesdays)):
-        w_prev = wednesdays[i - 1]
-        w_next = wednesdays[i]
-        # Trading days strictly after w_prev, up to and including w_next
-        mask = (td > w_prev) & (td <= w_next)
-        days = td[mask].tolist()
-        week1_days.extend(days)
-        log.debug("  Cycle %d (%s -> %s): %d Week-1 days",
-                  i, w_prev.date(), w_next.date(), len(days))
+    for ym, grp in df.groupby("year_month"):
+        wednesdays_in_month = grp.loc[grp["date"].dt.dayofweek == 2, "date"]
+        if wednesdays_in_month.empty:
+            # Edge case: a month with no Wednesday trading day -- skip it.
+            log.warning("  Month %s: no Wednesday trading day found -- skipped", ym)
+            continue
+        first_wed = wednesdays_in_month.min()   # earliest Wednesday in this month
+        # Week 1 = every trading day from month-start up to (and incl.) first_wed
+        month_week1 = grp.loc[grp["date"] <= first_wed, "date"].tolist()
+        week1_days.extend(month_week1)
+        log.info("  Month %s: first Wed = %s, Week-1 days = %d",
+                 ym, first_wed.date(), len(month_week1))
 
     week1_days_sorted = sorted(set(week1_days))
-    log.info("Total Week-1 trading days selected: %d", len(week1_days_sorted))
+    log.info("Total Week-1 trading days selected: %d (out of %d total trading days; "
+             "excluded %d days from weeks 2-4 of each month)",
+             len(week1_days_sorted), len(td), len(td) - len(week1_days_sorted))
     return week1_days_sorted
 
 
@@ -908,10 +906,15 @@ def write_guide_sheet(ws):
         ("Starting Capital", f"Rs {STARTING_CAPITAL:,} (ten lakh). Single configurable constant. Used for CAGR and NAV calculation only; position size does not scale."),
         ("", ""),
         ("ASSUMPTION #1 -- Week 1 Definition", ""),
-        ("", "Bank Nifty has WEEKLY expiries every Wednesday. After each Wednesday expiry W, the NEXT calendar week (Mon-Fri block whose Wednesday is W+7) is 'Week 1' of the new cycle."),
-        ("", "Every trading day in that Mon-Fri block is traded -- including the new expiry Wednesday itself."),
-        ("", "This interpretation treats each Wednesday-to-Wednesday span as one cycle. The definition is encapsulated in get_week1_trading_days() in the code and can be changed in one place."),
-        ("", "The very first cycle is treated as: dataset start to first Wednesday (inclusive)."),
+        ("", "CORRECTED interpretation: 'Week 1' means the first week of each calendar MONTH."),
+        ("", "Specifically: for each month, find the first Wednesday of that month. "
+              "Every trading day from the 1st of the month up to and including that first Wednesday is a 'Week-1' day. "
+              "Thursdays onward (weeks 2, 3, 4) are excluded."),
+        ("", "Why monthly, not weekly: Bank Nifty had weekly expiries (every Wednesday) in 2023. "
+              "A weekly-cycle definition is a no-op -- since every week has a Wednesday, every week trivially "
+              "satisfies 'first week after the last expiry.' The filter must operate on a monthly cycle to exclude anything."),
+        ("", "This cuts the universe to ~1/4-1/5 of all trading days (typically Mon-Wed of the first week each month)."),
+        ("", "The definition lives entirely in get_week1_trading_days() and can be changed in one place."),
         ("", ""),
         ("ASSUMPTION #2 -- Tie-Break Rule", ""),
         ("", "If two strikes are exactly equidistant from Rs 50, the one with the LOWER premium (cheaper, further OTM) is chosen."),
@@ -1256,34 +1259,123 @@ def main():
     print(stats["monthly_pnl"].to_string(index=False))
     print()
 
-    # -- Self-check assertions -----------------------------------------------
-    print("\n  SELF-CHECK (final verification)")
+    # -- Self-check assertions (real computed checks, not cosmetic Trues) ------
+    # Each check is an actual assertion evaluated against trade_df and stats.
+    # A FAIL here means something in the code is wrong, not just undocumented.
+    print("\n  SELF-CHECK (computed assertions against trade data)")
     print("=" * 70)
-    checks = {
-        "No lookahead: stop scan starts AFTER entry bar":
-            True,   # enforced in compute_exit via time_str > ENTRY_TIME_STR
-        "SL uses High column":
-            True,   # enforced in compute_exit (ticker_rows['high'] >= stop_level)
-        "SL checked independently per leg":
-            True,   # each leg calls compute_exit separately
-        "Only Week-1 days traded":
-            True,   # trade_df rows come only from week1_days list
-        "Position size fixed (no compounding)":
-            bool((trade_df["quantity"] == LOT_SIZE).all()),
-        "One row per leg per day (2 rows/day max)":
-            True,   # by construction in build_trade_sheet
-        "Equity curve updated trade-wise":
-            True,   # cumulative_pnl incremented per row in build_trade_sheet
-        "Max drawdown from running peak":
-            True,   # compute_statistics uses cummax()
-        "No minute-level loop in backtest":
-            True,   # compute_exit uses vectorized pandas boolean mask + argmax
-        "Runtime printed":
-            True,
-    }
-    for check, passed in checks.items():
-        status = "PASS" if passed else "FAIL"
-        print(f"  [{status}] {check}")
+
+    week1_set = set(pd.Timestamp(d) for d in week1_days)
+    td_full   = stats["trade_df"]
+
+    def check(label: str, result: bool, detail: str = ""):
+        status = "PASS" if result else "FAIL"
+        suffix = f"  ({detail})" if detail else ""
+        print(f"  [{status}] {label}{suffix}")
+        return result
+
+    all_passed = True
+
+    # 1. Every traded date is a Week-1 date
+    traded_dates = set(pd.Timestamp(d) for d in trade_df["entry_date"].unique())
+    non_week1 = traded_dates - week1_set
+    all_passed &= check(
+        "Only Week-1 days traded",
+        len(non_week1) == 0,
+        f"{len(non_week1)} non-Week1 dates found" if non_week1 else "all dates verified",
+    )
+
+    # 2. SL exits: exit_time > entry_time (no lookahead — stop can't fire at or before entry)
+    sl_rows = trade_df[trade_df["exit_reason"] == "SL"]
+    if not sl_rows.empty:
+        lookahead_sl = sl_rows[sl_rows["exit_time"] <= sl_rows["entry_time"]]
+        all_passed &= check(
+            "SL exits are strictly after entry time",
+            len(lookahead_sl) == 0,
+            f"{len(lookahead_sl)} lookahead SL rows" if not lookahead_sl.empty else f"{len(sl_rows)} SL exits verified",
+        )
+    else:
+        check("SL exits are strictly after entry time", True, "no SL exits in dataset")
+
+    # 3. Time exits: exit_time == EXIT_TIME_STR (or TIME_FALLBACK)
+    time_rows = trade_df[trade_df["exit_reason"].isin(["TIME", "TIME_FALLBACK"])]
+    wrong_time = time_rows[time_rows["exit_time"] > EXIT_TIME_STR]
+    all_passed &= check(
+        "Time exits at or before 15:20:59",
+        len(wrong_time) == 0,
+        f"{len(wrong_time)} exits after 15:20" if not wrong_time.empty else f"{len(time_rows)} time exits verified",
+    )
+
+    # 4. Fixed lot size — no scaling
+    all_passed &= check(
+        "Position size fixed at LOT_SIZE throughout",
+        bool((trade_df["quantity"] == LOT_SIZE).all()),
+        f"all {len(trade_df)} rows have qty={LOT_SIZE}",
+    )
+
+    # 5. One row per (date, option_type) — no duplicate legs
+    dup_legs = trade_df.duplicated(subset=["entry_date", "option_type"], keep=False)
+    all_passed &= check(
+        "No duplicate (date, option_type) rows",
+        not dup_legs.any(),
+        f"{dup_legs.sum()} duplicate leg rows found" if dup_legs.any() else "unique",
+    )
+
+    # 6. Gross P&L sign sanity: short P&L = entry_value - exit_value
+    recomputed_pnl = (trade_df["entry_value"] - trade_df["exit_value"]).round(4)
+    pnl_mismatch = (recomputed_pnl - trade_df["gross_pnl"]).abs() > 0.01
+    all_passed &= check(
+        "Gross P&L = entry_value - exit_value (short formula)",
+        not pnl_mismatch.any(),
+        f"{pnl_mismatch.sum()} mismatches" if pnl_mismatch.any() else "all verified",
+    )
+
+    # 7. Cumulative P&L is monotonically consistent (each row = prior + gross_pnl)
+    expected_cum = trade_df["gross_pnl"].cumsum().round(4)
+    cum_mismatch = (expected_cum - trade_df["cumulative_pnl"]).abs() > 0.01
+    all_passed &= check(
+        "Cumulative P&L is consistent (trade-wise running sum)",
+        not cum_mismatch.any(),
+        f"{cum_mismatch.sum()} mismatches" if cum_mismatch.any() else "all verified",
+    )
+
+    # 8. Available capital = STARTING_CAPITAL + cumulative_pnl at every row
+    expected_cap = (STARTING_CAPITAL + trade_df["cumulative_pnl"]).round(4)
+    cap_mismatch = (expected_cap - trade_df["available_capital"]).abs() > 0.01
+    all_passed &= check(
+        "Available capital = start_cap + cumulative_pnl",
+        not cap_mismatch.any(),
+        f"{cap_mismatch.sum()} mismatches" if cap_mismatch.any() else "all verified",
+    )
+
+    # 9. Max drawdown computed from running peak (not just min of NAV series)
+    #    Verify: drawdown at each point = (nav - running_peak) / running_peak
+    nav_s = pd.concat([pd.Series([100.0]), td_full["nav_index"]])
+    peak_s = nav_s.cummax()
+    dd_s   = (nav_s - peak_s) / peak_s * 100
+    reported_maxdd = stats["stats_summary"]["Max Drawdown (%)"]
+    computed_maxdd = round(dd_s.min(), 4)
+    all_passed &= check(
+        "Max drawdown from running peak",
+        abs(reported_maxdd - computed_maxdd) < 0.01,
+        f"reported={reported_maxdd:.4f}% computed={computed_maxdd:.4f}%",
+    )
+
+    # 10. SL stop price = entry * 1.5 (not bar close)
+    if not sl_rows.empty:
+        expected_sl_price = (sl_rows["entry_price"] * SL_MULTIPLIER).round(4)
+        sl_price_ok = (expected_sl_price - sl_rows["exit_price"]).abs() < 0.01
+        all_passed &= check(
+            "SL exit_price = entry_price * 1.5 (not bar close)",
+            sl_price_ok.all(),
+            f"{(~sl_price_ok).sum()} rows with wrong SL price" if not sl_price_ok.all() else f"{len(sl_rows)} SL exits verified",
+        )
+    else:
+        check("SL exit_price = entry_price * 1.5", True, "no SL exits")
+
+    print("=" * 70)
+    overall = "ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED -- review output above"
+    print(f"  Overall: {overall}")
     print("=" * 70 + "\n")
 
     print(f"  Output saved: {OUTPUT_EXCEL.resolve()}\n")
